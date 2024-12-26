@@ -1,5 +1,5 @@
 from typing import Annotated
-from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi import FastAPI, HTTPException, Depends, status, Response
 from pydantic import BaseModel
 from sqlalchemy import create_engine, Column, Integer, String, Boolean
 from sqlalchemy.ext.declarative import declarative_base
@@ -173,12 +173,33 @@ def authenticate_user(db: Session, username: str, password: str):
     return user
 
 
+# def create_access_token(data: dict, expires_delta: timedelta | None = None):
+#     to_encode = data.copy()
+#     if expires_delta:
+#         expire = datetime.now(timezone.utc) + expires_delta
+#     else:
+#         expire = datetime.now(timezone.utc) + timedelta(minutes=15)
+#     to_encode.update({"exp": expire})
+#     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+#     return encoded_jwt
+
+
 def create_access_token(data: dict, expires_delta: timedelta | None = None):
     to_encode = data.copy()
     if expires_delta:
         expire = datetime.now(timezone.utc) + expires_delta
     else:
         expire = datetime.now(timezone.utc) + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+
+def create_refresh_token(data: dict):
+    expire = datetime.now(timezone.utc) + timedelta(
+        days=7
+    )  # Срок действия refresh_token
+    to_encode = data.copy()
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
@@ -197,9 +218,29 @@ def fake_decode_token(token: str, db: Session):
     return user
 
 
-@app.post("/token", response_model=Token)
+# @app.post("/token", response_model=Token)
+# async def login_for_access_token(
+#     form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)
+# ):
+#     user = authenticate_user(db, form_data.username, form_data.password)
+#     if not user:
+#         raise HTTPException(
+#             status_code=status.HTTP_401_UNAUTHORIZED,
+#             detail="Incorrect username or password",
+#             headers={"WWW-Authenticate": "Bearer"},
+#         )
+#     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+#     access_token = create_access_token(
+#         data={"sub": user.username}, expires_delta=access_token_expires
+#     )
+#     return {"access_token": access_token, "token_type": "bearer"}
+
+
+@app.post("/token", response_model=dict)
 async def login_for_access_token(
-    form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)
+    response: Response,
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_db),
 ):
     user = authenticate_user(db, form_data.username, form_data.password)
     if not user:
@@ -208,11 +249,79 @@ async def login_for_access_token(
             detail="Incorrect username or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
         data={"sub": user.username}, expires_delta=access_token_expires
     )
-    return {"access_token": access_token, "token_type": "bearer"}
+    refresh_token = create_refresh_token(data={"sub": user.username})
+
+    # Устанавливаем токены в cookies
+    response.set_cookie(
+        key="access_token",
+        value=f"Bearer {access_token}",
+        httponly=True,
+        max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        secure=True,
+        samesite="Lax",
+    )
+    response.set_cookie(
+        key="refresh_token",
+        value=f"Bearer {refresh_token}",
+        httponly=True,
+        max_age=7 * 24 * 60 * 60,  
+        secure=True,
+        samesite="Lax",
+    )
+
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+    }
+
+
+@app.post("/refresh", response_model=Token)
+async def refresh_access_token(
+    response: Response,
+    token: Annotated[str, Depends(oauth2_scheme)],
+    db: Session = Depends(get_db),
+):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid refresh token",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+        token_data = TokenData(username=username)
+    except InvalidTokenError:
+        raise credentials_exception
+
+    user = get_user(username=token_data.username, db=db)
+    if not user:
+        raise credentials_exception
+
+    # Создаём новый access_token
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    new_access_token = create_access_token(
+        data={"sub": user.username}, expires_delta=access_token_expires
+    )
+
+    # Устанавливаем новый токен в cookies
+    response.set_cookie(
+        key="access_token",
+        value=f"Bearer {new_access_token}",
+        httponly=True,
+        max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        secure=True,
+        samesite="Lax",
+    )
+
+    return {"access_token": new_access_token, "token_type": "bearer"}
 
 
 @app.post("/register/", response_model=UserResponse)
